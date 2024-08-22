@@ -1,0 +1,331 @@
+commit a5be77cb0ca356364c7c41e0722411f4cc2f8cc2
+Author: dengpan <dengpan.yin@accenture.com>
+Date:   Mon Jul 29 07:10:17 2024 +0000
+
+    nemo
+
+diff --git a/lmdeploy/serve/openai/api_server.py b/lmdeploy/serve/openai/api_server.py
+index 08f4de1..62a3da4 100644
+--- a/lmdeploy/serve/openai/api_server.py
++++ b/lmdeploy/serve/openai/api_server.py
+@@ -114,10 +114,11 @@ def create_error_response(status: HTTPStatus, message: str):
+ 
+ async def check_request(request) -> Optional[JSONResponse]:
+     """Check if a request is valid."""
+-    if hasattr(request, 'model') and request.model not in get_model_list():
+-        return create_error_response(
+-            HTTPStatus.BAD_REQUEST,
+-            f'The model `{request.model}` does not exist.')
++    # if hasattr(request, 'model') and request.model not in get_model_list():
++    #     print(f"available models: {get_model_list()}")
++    #     return create_error_response(
++    #         HTTPStatus.BAD_REQUEST,
++    #         f'The model `{request.model}` does not exist.')
+     if hasattr(request, 'n') and request.n <= 0:
+         return create_error_response(
+             HTTPStatus.BAD_REQUEST,
+diff --git a/lmdeploy/turbomind/deploy/target_model/base.py b/lmdeploy/turbomind/deploy/target_model/base.py
+index be0ad4a..416bf5c 100644
+--- a/lmdeploy/turbomind/deploy/target_model/base.py
++++ b/lmdeploy/turbomind/deploy/target_model/base.py
+@@ -41,6 +41,7 @@ class TurbomindModelConfig:
+     head_num: int = None
+     kv_head_num: int = None
+     vocab_size: int = None
++    hidden_size: int = None
+     num_layer: int = None
+     inter_size: int = None
+     norm_eps: float = None
+@@ -191,7 +192,8 @@ class BaseOutputModel(ABC):
+             emb = bin.tok_embeddings()
+             if emb is not None:
+                 _vocab_size, dim = emb.shape
+-                head_num = dim // cfg.size_per_head
++                #head_num = dim // cfg.size_per_head
++                head_num = cfg.attn_head_num
+                 break
+         final_cfg.update(dict(head_num=head_num, vocab_size=_vocab_size))
+         return TurbomindModelConfig.from_dict(final_cfg, allow_none=True)
+diff --git a/lmdeploy/turbomind/turbomind.py b/lmdeploy/turbomind/turbomind.py
+index 4ae170c..9f6a747 100644
+--- a/lmdeploy/turbomind/turbomind.py
++++ b/lmdeploy/turbomind/turbomind.py
+@@ -205,9 +205,9 @@ class TurboMind:
+                 engine_config.model_format is None:
+             engine_config.model_format = 'awq'
+ 
++        hf_cfg = get_hf_config_content(model_path)
+         if engine_config.model_format is None:
+-            cfg = get_hf_config_content(model_path)
+-            quant_config = cfg.get('quantization_config')
++            quant_config = hf_cfg.get('quantization_config')
+             if quant_config:
+                 quant_method = quant_config.get('quant_method')
+                 group_size = int(quant_config.get('group_size', 0))
+@@ -232,6 +232,7 @@ class TurboMind:
+             model_format=engine_config.model_format,
+             group_size=0)
+         cfg.update_from_engine_config(engine_config)
++        cfg.hidden_size = hf_cfg.get('hidden_size')
+         output_model = OUTPUT_MODELS.get(output_model_name)(
+             input_model=input_model, cfg=cfg, to_file=False, out_dir='')
+ 
+diff --git a/src/turbomind/models/llama/LlamaDecoderLayerWeight.cc b/src/turbomind/models/llama/LlamaDecoderLayerWeight.cc
+index d055248..81044a0 100644
+--- a/src/turbomind/models/llama/LlamaDecoderLayerWeight.cc
++++ b/src/turbomind/models/llama/LlamaDecoderLayerWeight.cc
+@@ -31,6 +31,7 @@ LlamaDecoderLayerWeight<T>::LlamaDecoderLayerWeight(int        layer_idx,
+                                                     size_t     head_num,
+                                                     size_t     kv_head_num,
+                                                     size_t     size_per_head,
++                                                    size_t     hidden_size,
+                                                     size_t     inter_size,
+                                                     WeightType weight_type,
+                                                     int        group_size,
+@@ -41,7 +42,7 @@ LlamaDecoderLayerWeight<T>::LlamaDecoderLayerWeight(int        layer_idx,
+     head_num_(head_num),
+     kv_head_num_(kv_head_num),
+     size_per_head_(size_per_head),
+-    hidden_units_(head_num * size_per_head),
++    hidden_units_(hidden_size),
+     inter_size_(inter_size),
+     weight_type_(weight_type),
+     attn_bias_(attn_bias),
+@@ -91,7 +92,7 @@ LlamaDecoderLayerWeight<T>::LlamaDecoderLayerWeight(int        layer_idx,
+     self_attn_weights.qkv.type        = weight_type;
+     self_attn_weights.qkv.group_size  = group_size;
+ 
+-    self_attn_weights.output.input_dims  = hidden_units_ / tensor_para_size_;
++    self_attn_weights.output.input_dims  = (head_num * size_per_head) / tensor_para_size_;
+     self_attn_weights.output.output_dims = hidden_units_;
+     self_attn_weights.output.type        = weight_type;
+     self_attn_weights.output.group_size  = group_size;
+diff --git a/src/turbomind/models/llama/LlamaDecoderLayerWeight.h b/src/turbomind/models/llama/LlamaDecoderLayerWeight.h
+index 5086adf..37e8d65 100644
+--- a/src/turbomind/models/llama/LlamaDecoderLayerWeight.h
++++ b/src/turbomind/models/llama/LlamaDecoderLayerWeight.h
+@@ -34,6 +34,7 @@ public:
+                             size_t     head_num,
+                             size_t     kv_head_num,
+                             size_t     size_per_head,
++                            size_t     hidden_size,
+                             size_t     inter_size,
+                             WeightType weight_type,
+                             int        group_size,
+diff --git a/src/turbomind/models/llama/LlamaFfnLayer.h b/src/turbomind/models/llama/LlamaFfnLayer.h
+index 6a41430..c166b37 100644
+--- a/src/turbomind/models/llama/LlamaFfnLayer.h
++++ b/src/turbomind/models/llama/LlamaFfnLayer.h
+@@ -33,6 +33,7 @@ class LlamaFfnLayer {
+ public:
+     LlamaFfnLayer(size_t           head_num,
+                   size_t           size_per_head,
++                  size_t           hidden_size,
+                   size_t           inter_size,
+                   NcclParam        tensor_para,
+                   cudaStream_t     stream,
+@@ -42,7 +43,7 @@ public:
+         head_num_(head_num),
+         size_per_head_(size_per_head),
+         inter_size_(inter_size / tensor_para.world_size_),
+-        hidden_units_(head_num * size_per_head),
++        hidden_units_(hidden_size),
+         stream_(stream),
+         linear_(cublas_wrapper, stream),
+         allocator_(allocator),
+diff --git a/src/turbomind/models/llama/LlamaV2.cc b/src/turbomind/models/llama/LlamaV2.cc
+index d08b021..5cb0026 100644
+--- a/src/turbomind/models/llama/LlamaV2.cc
++++ b/src/turbomind/models/llama/LlamaV2.cc
+@@ -49,6 +49,7 @@ LlamaV2<T>::LlamaV2(size_t                       head_num,
+                     size_t                       inter_size,
+                     size_t                       num_layer,
+                     size_t                       vocab_size,
++                    size_t                       hidden_size,
+                     float                        norm_eps,
+                     const LlamaAttentionParams&  attn_params,
+                     int                          start_id,
+@@ -76,7 +77,7 @@ LlamaV2<T>::LlamaV2(size_t                       head_num,
+     rmsnorm_eps_(norm_eps),
+     start_id_(start_id),
+     end_id_(end_id),
+-    hidden_units_(head_num * size_per_head),
++    hidden_units_(hidden_size),
+     local_head_num_(head_num / tensor_para.world_size_),
+     local_kv_head_num_(kv_head_num / tensor_para.world_size_),
+     weights_(weights),
+@@ -126,6 +127,7 @@ void LlamaV2<T>::initialize(const LlamaAttentionParams& attn_params,
+     unified_decoder_.reset(new UnifiedDecoder<T>(head_num_,
+                                                  kv_head_num,
+                                                  size_per_head_,
++                                                 hidden_units_,
+                                                  inter_size_,
+                                                  num_layer_,
+                                                  attn_params,
+diff --git a/src/turbomind/models/llama/LlamaV2.h b/src/turbomind/models/llama/LlamaV2.h
+index f863861..0457059 100644
+--- a/src/turbomind/models/llama/LlamaV2.h
++++ b/src/turbomind/models/llama/LlamaV2.h
+@@ -60,6 +60,7 @@ public:
+             size_t                       inter_size,
+             size_t                       num_layer,
+             size_t                       vocab_size,
++            size_t                       hidden_size,
+             float                        norm_eps,
+             const LlamaAttentionParams&  attn_params,
+             int                          start_id,
+diff --git a/src/turbomind/models/llama/LlamaWeight.cc b/src/turbomind/models/llama/LlamaWeight.cc
+index c87bc40..300a944 100644
+--- a/src/turbomind/models/llama/LlamaWeight.cc
++++ b/src/turbomind/models/llama/LlamaWeight.cc
+@@ -28,6 +28,7 @@ LlamaWeight<T>::LlamaWeight(size_t     head_num,
+                             size_t     size_per_head,
+                             size_t     inter_size,
+                             size_t     vocab_size,
++                            size_t     hidden_size,
+                             size_t     num_layer,
+                             bool       attn_bias,
+                             WeightType weight_type,
+@@ -35,7 +36,7 @@ LlamaWeight<T>::LlamaWeight(size_t     head_num,
+                             LoraParams lora_params,
+                             size_t     tensor_para_size,
+                             size_t     tensor_para_rank):
+-    hidden_units_(head_num * size_per_head),
++    hidden_units_(hidden_size),
+     inter_size_(inter_size),
+     vocab_size_(vocab_size),
+     vocab_size_padded_(vocab_size),
+@@ -54,6 +55,7 @@ LlamaWeight<T>::LlamaWeight(size_t     head_num,
+                                                                        head_num,
+                                                                        kv_head_num,
+                                                                        size_per_head,
++                                                                       hidden_size,
+                                                                        inter_size_,
+                                                                        weight_type_,
+                                                                        group_size,
+diff --git a/src/turbomind/models/llama/LlamaWeight.h b/src/turbomind/models/llama/LlamaWeight.h
+index 65eb986..e997c77 100644
+--- a/src/turbomind/models/llama/LlamaWeight.h
++++ b/src/turbomind/models/llama/LlamaWeight.h
+@@ -34,6 +34,7 @@ struct LlamaWeight {
+                 size_t     size_per_head,
+                 size_t     inter_size,
+                 size_t     vocab_size,
++                size_t     hidden_size,
+                 size_t     num_layer,
+                 bool       attn_bias,
+                 WeightType weight_type,
+diff --git a/src/turbomind/models/llama/unified_attention_layer.h b/src/turbomind/models/llama/unified_attention_layer.h
+index 6b6bbba..e0196b6 100644
+--- a/src/turbomind/models/llama/unified_attention_layer.h
++++ b/src/turbomind/models/llama/unified_attention_layer.h
+@@ -53,6 +53,7 @@ public:
+     UnifiedAttentionLayer(size_t               head_num,
+                           size_t               kv_head_num,
+                           size_t               size_per_head,
++                          size_t               hidden_size,
+                           LlamaAttentionParams attn_params,
+                           NcclParam            tensor_para,
+                           LoraParams           lora_params,
+@@ -64,7 +65,7 @@ public:
+                           int                  quant_policy):
+         head_num_(head_num),
+         size_per_head_(size_per_head),
+-        hidden_units_(head_num * size_per_head),
++        hidden_units_(hidden_size),
+         local_head_num_(head_num / tensor_para.world_size_),
+         local_kv_head_num_(kv_head_num / tensor_para.world_size_),
+         head_n_rep_(head_num / kv_head_num),
+diff --git a/src/turbomind/models/llama/unified_decoder.cc b/src/turbomind/models/llama/unified_decoder.cc
+index f567ffc..f1f8baf 100644
+--- a/src/turbomind/models/llama/unified_decoder.cc
++++ b/src/turbomind/models/llama/unified_decoder.cc
+@@ -38,6 +38,7 @@ void UnifiedDecoder<T>::initialize(const LlamaAttentionParams& attn_params,
+     attn_layer_ = new UnifiedAttentionLayer<T>(head_num_,
+                                                kv_head_num,
+                                                size_per_head_,
++                                               hidden_units_,
+                                                attn_params,
+                                                tensor_para_,
+                                                lora_params_,
+@@ -50,6 +51,7 @@ void UnifiedDecoder<T>::initialize(const LlamaAttentionParams& attn_params,
+ 
+     ffn_layer_ = new LlamaFfnLayer<T>(head_num_,
+                                       size_per_head_,
++                                      hidden_units_,
+                                       inter_size_,
+                                       tensor_para_,
+                                       stream_,
+diff --git a/src/turbomind/models/llama/unified_decoder.h b/src/turbomind/models/llama/unified_decoder.h
+index a48c822..19c9585 100644
+--- a/src/turbomind/models/llama/unified_decoder.h
++++ b/src/turbomind/models/llama/unified_decoder.h
+@@ -61,6 +61,7 @@ public:
+     UnifiedDecoder(size_t                      head_num,
+                    size_t                      kv_head_num,
+                    size_t                      size_per_head,
++                   size_t                      hidden_size,
+                    size_t                      inter_size,
+                    size_t                      num_layer,
+                    const LlamaAttentionParams& attn_params,
+@@ -82,7 +83,7 @@ public:
+         head_num_(head_num),
+         size_per_head_(size_per_head),
+         inter_size_(inter_size),
+-        hidden_units_(head_num * size_per_head),
++        hidden_units_(hidden_size),
+         num_layer_(num_layer),
+         rmsnorm_eps_(rmsnorm_eps),
+         tensor_para_(tensor_para),
+diff --git a/src/turbomind/triton_backend/llama/LlamaTritonModel.cc b/src/turbomind/triton_backend/llama/LlamaTritonModel.cc
+index c5b0bf8..28d5085 100644
+--- a/src/turbomind/triton_backend/llama/LlamaTritonModel.cc
++++ b/src/turbomind/triton_backend/llama/LlamaTritonModel.cc
+@@ -195,6 +195,7 @@ LlamaTritonModel<T>::LlamaTritonModel(size_t      tensor_para_size,
+     inter_size_          = reader.GetInteger("llama", "inter_size");
+     num_layer_           = reader.GetInteger("llama", "num_layer");
+     vocab_size_          = reader.GetInteger("llama", "vocab_size");
++    hidden_size_         = reader.GetInteger("llama", "hidden_size");
+     norm_eps_            = reader.GetFloat("llama", "norm_eps");
+     start_id_            = reader.GetInteger("llama", "start_id");
+     end_id_              = reader.GetInteger("llama", "end_id");
+@@ -330,6 +331,7 @@ std::unique_ptr<LlamaTritonSharedModelInstance<T>> LlamaTritonModel<T>::createSh
+                                                   inter_size_,
+                                                   num_layer_,
+                                                   vocab_size_,
++                                                  hidden_size_,
+                                                   norm_eps_,
+                                                   attn_params_,
+                                                   start_id_,
+@@ -401,6 +403,7 @@ void LlamaTritonModel<T>::createSharedWeights(int device_id, int rank)
+                                                                       size_per_head_,
+                                                                       inter_size_,
+                                                                       vocab_size_,
++                                                                      hidden_size_,
+                                                                       num_layer_,
+                                                                       attn_bias_,
+                                                                       weight_type_,
+diff --git a/src/turbomind/triton_backend/llama/LlamaTritonModel.h b/src/turbomind/triton_backend/llama/LlamaTritonModel.h
+index c0a0ebf..2df19f6 100644
+--- a/src/turbomind/triton_backend/llama/LlamaTritonModel.h
++++ b/src/turbomind/triton_backend/llama/LlamaTritonModel.h
+@@ -88,6 +88,7 @@ private:
+     size_t                          inter_size_;
+     size_t                          num_layer_;
+     size_t                          vocab_size_;
++    size_t                          hidden_size_;
+     turbomind::LlamaAttentionParams attn_params_;
+     turbomind::EngineParams         engine_params_;
+     float                           norm_eps_;
+diff --git a/src/turbomind/utils/allocator.h b/src/turbomind/utils/allocator.h
+index d995e2a..f2b0c45 100644
+--- a/src/turbomind/utils/allocator.h
++++ b/src/turbomind/utils/allocator.h
+@@ -230,6 +230,7 @@ public:
+ #if defined(CUDA_MEMORY_POOL_DISABLED)
+             check_cuda_error(cudaMalloc(&ptr, (size_t)(ceil(size / 32.)) * 32));
+ #else
++            TM_LOG_INFO("Allocating size %ld", size);
+             check_cuda_error(cudaMallocAsync(&ptr, (size_t)(ceil(size / 32.)) * 32, stream_));
+ #endif
+         }

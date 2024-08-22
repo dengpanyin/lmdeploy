@@ -468,7 +468,8 @@ async def chat_completions_v1(request: ChatCompletionRequest,
 
     tool_calls = None
     if request.tool_choice != 'none' and ('<|plugin|>' in text
-                                          or '<function=' in text):
+                                          or '<function=' in text
+                                          or '[TOOL_CALLS]' in text):
         if final_res.finish_reason == 'stop':
             final_res.finish_reason = 'tool_calls'
         try:  # TODO add json_schema guidance to turbomind

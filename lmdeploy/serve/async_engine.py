@@ -633,6 +633,15 @@ class AsyncEngine(LogitsMixin):
             action, _ = text.split('</function>')
             parameters = action[action.find('{'):]
             name = action.split('<function=')[1].split('>{')[0]
+        elif '[TOOL_CALLS]' in text:
+            # Extract the substring after '[TOOL_CALLS]'
+            tool_calls_string = text.split('[TOOL_CALLS]')[1]
+
+            # Convert JSON string to Python list of dictionaries
+            tool_calls_list = json.loads(tool_calls_string)
+            tool_call = tool_calls_list[0]
+            name = tool_call['name']
+            parameters = json.dumps(tool_call['arguments'])
         else:
             raise RuntimeError(f'Unexpected model response: {text}')
         action_id = [tool.function.name for tool in tools].index(name)

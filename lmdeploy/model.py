@@ -1175,6 +1175,16 @@ class MistralChat(BaseChatTemplate):
     def __init__(self, user='[INST] ', eoh=' [/INST]', eoa='</s>', **kwargs):
         super().__init__(user=user, eoh=eoh, eoa=eoa, **kwargs)
 
+    def messages2prompt(self,
+                        messages,
+                        sequence_start=True,
+                        tools=None,
+                        **kwargs):
+        tools_prompt = ''
+        if tools:
+            tools_prompt = '[AVAILABLE_TOOLS]' + json.dumps(tools, ensure_ascii=False) + '[/AVAILABLE_TOOLS]'
+        return tools_prompt + super().messages2prompt(messages, sequence_start, kwargs=kwargs)
+
     @classmethod
     def match(cls, model_path: str) -> Optional[str]:
         """Return the model_name that was registered to MODELS.
